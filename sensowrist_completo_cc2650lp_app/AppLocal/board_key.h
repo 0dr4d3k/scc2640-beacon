@@ -66,7 +66,7 @@ extern "C" {
 #define KEY_1              0x0001
    
 // Debounce timeout in milliseconds
-#define KEY_DEBOUNCE_TIMEOUT  200
+#define KEY_DEBOUNCE_TIMEOUT  100
 
 /*********************************************************************
  * TYPEDEFS

@@ -48,7 +48,6 @@
 /*********************************************************************
  * INCLUDES
  */
-
 #include <ti/sysbios/knl/Task.h>
 #include <ti/sysbios/knl/Clock.h>
 #include <ti/sysbios/knl/Semaphore.h>
@@ -79,7 +78,6 @@
 #include <driverlib/aon_batmon.h>
 
 
-
 /*********************************************************************
  * MACROS
  */
@@ -87,15 +85,46 @@
 /*********************************************************************
  * CONSTANTS
  */
+// Select the beacon type
+//#define BEACON_WRISTBAND
+#define BEACON_KEYRINGUS
 
-#define PERIODO_ADVERTISING_EN_SEGUNDOS 3
-#define PERIODO_ADVERTISING_ALARMA_EN_SEGUNDOS 1
+
+#ifdef BEACON_WRISTBAND
+#define PERIODO_ADVERTISING_EN_SEGUNDOS          3
+#define PERIODO_ADVERTISING_ALARMA_EN_SEGUNDOS   1
+
+#define EVENTOS_EN_UN_MINUTO                     60/PERIODO_ADVERTISING_ALARMA_EN_SEGUNDOS // Se usa para borrar la alarma
+#define LED_BLINK_DURATION_MS                    50 // Flashing led every PERIODO_ADVERTISING_ALARMA_EN_SEGUNDOS time
+#endif
+
+#ifdef BEACON_KEYRINGUS
+#define PERIODO_ADVERTISING_EN_SEGUNDOS          7
+#define PERIODO_ADVERTISING_ALARMA_EN_SEGUNDOS   0
+
+#define EVENTOS_EN_UN_MINUTO                     0 // Alarm no allowed in keyringus mode
+#define LED_BLINK_DURATION_MS                    0 // Led on pressing pushbutton
+#endif
+
+#define PERIODO_ADV_KEEPALIVE_EN_SEGUNDOS        10
+
+// Wakeup timer (in milliseconds)
+#define WAKEUP_TIMER                             10*1000 // Time pressing the button to start advertising
+
+// Key timers (in milliseconds)
+#define SHORTKEY_TIMER                           10*1000 // Time pressing the button to enter in keepalive state
+#define LONGKEY_TIMER                            20*1000 // Time pressing the button to enter in warehouse state
+
+// Initial led gretting (in milliseconds)
+#define HELLOWORLD_TIMER                         5*1000  // Initial led ON timer
+
+// Battery period (in milliseconds)
+#define BATTERY_PERIOD                           50*1000 // Battery measure period in seconds
 
 // What is the advertising interval when device is discoverable (units of 625us, 160=100ms), valid values: 32-16384
-#define DEFAULT_ADVERTISING_INTERVAL         (PERIODO_ADVERTISING_EN_SEGUNDOS*1600)
+#define LONG_ADVERTISING_INTERVAL           (PERIODO_ADV_KEEPALIVE_EN_SEGUNDOS*1600)
+#define DEFAULT_ADVERTISING_INTERVAL        (PERIODO_ADVERTISING_EN_SEGUNDOS*1600)
 #define ALARM_ADVERTISING_INTERVAL          (PERIODO_ADVERTISING_ALARMA_EN_SEGUNDOS*1600)
-#define EVENTOS_EN_UN_MINUTO				60 // (60/PERIODO_ADVERTISING_ALARMA_EN_SEGUNDOS) // Se usa para borrar la alarma, el periodo de adverising es 1 segundo con alarma
-#define LED_BLINK_DURATION_MS				50 //5
 
 // Task configuration
 #define SBB_TASK_PRIORITY                     1
@@ -107,37 +136,58 @@
 // Internal Events for RTOS application
 #define SBB_STATE_CHANGE_EVT                  0x0001
 #define SBB_KEY_CHANGE_EVT                    0x0002
+//#define SBB_LONGKEY_TIMEOUT_EVT               0x0004
+//#define SBB_SHORTKEY_TIMEOUT_EVT              0x0008
 #define SBB_ADV_EVT                    		  0x0080
+
+// Customer NV Items - Range 0x80 - 0x8F -
+#define SNV_ID_CONFIG          0x80
+
+// Flags in SNV_CONFIG register
+#define FLAG_FIRST_INI         0x01
+#define FLAG_WAREHOUSE         0x02
+
+// Application states definitions
+#define STATE_WAREHOUSE        0x01
+#define STATE_ADV_NORMAL       0x02
+#define STATE_ADV_ALARM        0x03
+#define STATE_ADV_KEEPALIVE    0x04
+
+#define ADV_STOP               0x01
+#define ADV_DEFAULT            0x02
+#define ADV_ALARM              0x03
+#define ADV_KEEPALIVE          0x04
 
 /*********************************************************************
  * TYPEDEFS
  */
-
 // App event passed from profiles.
 typedef struct
 {
   appEvtHdr_t hdr; // Event header.
 } sbbEvt_t;
 
+
 /*********************************************************************
  * GLOBAL VARIABLES
  */
-
 // Display Interface
 Display_Handle dispHandle = NULL;
+
 
 /*********************************************************************
  * EXTERNAL VARIABLES
  */
 
+
 /*********************************************************************
  * EXTERNAL FUNCTIONS
  */
 
+
 /*********************************************************************
  * LOCAL VARIABLES
  */
-
 // Entity ID globally used to check for source and/or destination of messages
 static ICall_EntityID selfEntity;
 
@@ -148,38 +198,43 @@ static ICall_Semaphore sem;
 static Queue_Struct appMsg;
 static Queue_Handle appMsgQueue;
 
+// Alarm counter
 static uint8_t alarmCounter=0;
+
+// Battery value
+static uint8_t batt;
+
+// Systen flag
+static bool keyTimeoutShort = false;
+static bool keyTimeoutLong  = false;
+
+// No volatile configuration register
+static uint8_t snvConfigReg;
+
+// Application Moore automate state.
+static uint8_t appState = STATE_WAREHOUSE;
 
 // Task configuration
 Task_Struct sbbTask;
 Char sbbTaskStack[SBB_TASK_STACK_SIZE];
 
 // GAP - SCAN RSP data (max size = 31 bytes)
+// oJo, not used in advertising not connectable mode
 static uint8 scanRspData[] =
 {
+#ifdef BEACON_WRISTBAND
   // complete name
-  0x15,   // length of this data
+  0x14,   // length of this data
   GAP_ADTYPE_LOCAL_NAME_COMPLETE,
-  'S',
-  'i',
-  'm',
-  'p',
-  'l',
-  'e',
-  'B',
-  'L',
-  'E',
-  'B',
-  'r',
-  'o',
-  'a',
-  'd',
-  'c',
-  'a',
-  's',
-  't',
-  'e',
-  'r',
+  's','m','a','r','t','c','a','r','e','-','w','r','i','s','t','b','a','n','d',
+#endif
+
+#ifdef BEACON_KEYRINGUS
+  // complete name
+  0x14,   // length of this data
+  GAP_ADTYPE_LOCAL_NAME_COMPLETE,
+  's','m','a','r','t','c','a','r','e','-','k','e','y','r','i','n','g','u','s',
+#endif
 
   // Tx power level
   0x02,   // length of this data
@@ -201,11 +256,10 @@ uint8 advertData[] =
 
   // three-byte broadcast of the data "1 2 3"
   0x04,   // length of this data including the data type byte
-  GAP_ADTYPE_MANUFACTURER_SPECIFIC, // manufacturer specific adv data type
+  GAP_ADTYPE_MANUFACTURER_SPECIFIC, // manufacturer specific adv. data type
   0x41,
   0, // status
-  0 // counter
-
+  0  // counter
 };
 
 PIN_State  ledCtrlState;
@@ -216,12 +270,17 @@ PIN_Config ledCtrlCfg[] =
 };
 PIN_Handle ledCtrlHandle;
 
+// Timers
 static Clock_Struct initialLEDTimer;
+static Clock_Struct batteryMeasureTimer;
+static Clock_Struct wakeupTimer;
+static Clock_Struct shortkeyTimer;
+static Clock_Struct longkeyTimer;
+
 
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
-
 static void SimpleBLEBroadcaster_init(void);
 static void SimpleBLEBroadcaster_taskFxn(UArg a0, UArg a1);
 
@@ -233,24 +292,76 @@ static void SimpleBLEBroadcaster_stateChangeCB(gaprole_States_t newState);
 
 void SimpleBLEBroadcaster_keyChangeHandler(uint8 keys);
 
+void SimpleBLEPeripheral_atuomateHandler(uint8 keys);
 
+void setAdvIntData(uint8_t adv_mode);
 
 static void InitialLEDTimingHandler(UArg a0)
 {
 	PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_OFF);
 }
 
+static void BatteryMeasureTimingHandler(UArg a0)
+{
+    // Battery monitor (bit 10:8 - integer, but 7:0 fraction)
+    uint32_t batt_raw = AONBatMonBatteryVoltageGet();
+
+    // Parse and round battery raw data
+    uint8_t  intPart = (batt_raw & 0x0300) >> 4;
+    uint32_t dPart   = ((batt_raw & 0x00FF) * 100) / 256;
+    uint8_t  decPart = (dPart / 10) + (dPart % 10>5);
+    if (decPart == 10) {decPart=0; intPart++;}
+
+    // Compose battery
+    batt = intPart | decPart;
+}
+
+
+static void longkeyTimingHandler(UArg a0)
+{
+    keyTimeoutLong = true;
+    /*
+    sbbEvt_t *pMsg;
+
+    // Create dynamic pointer to message.
+    if ((pMsg = ICall_malloc(sizeof(sbbEvt_t))))
+    {
+      pMsg->hdr.event = SBB_LONGKEY_TIMEOUT_EVT;
+      pMsg->hdr.state = true;
+
+      // Enqueue the message.
+      Util_enqueueMsg(appMsgQueue, sem, (uint8*)pMsg);
+    }
+    */
+}
+
+static void shortkeyTimingHandler(UArg a0)
+{
+    keyTimeoutShort = true;
+    /*
+    sbbEvt_t *pMsg;
+
+    // Create dynamic pointer to message.
+    if ((pMsg = ICall_malloc(sizeof(sbbEvt_t))))
+    {
+      pMsg->hdr.event = SBB_SHORTKEY_TIMEOUT_EVT;
+      pMsg->hdr.state = true;
+
+      // Enqueue the message.
+      Util_enqueueMsg(appMsgQueue, sem, (uint8*)pMsg);
+    }
+    */
+}
+
 /*********************************************************************
  * PROFILE CALLBACKS
  */
-
-
-
 // GAP Role Callbacks
 static gapRolesCBs_t simpleBLEBroadcaster_BroadcasterCBs =
 {
   SimpleBLEBroadcaster_stateChangeCB   // Profile State Change Callbacks
 };
+
 
 /*********************************************************************
  * PUBLIC FUNCTIONS
@@ -278,6 +389,7 @@ void SimpleBLEBroadcaster_createTask(void)
   Task_construct(&sbbTask, SimpleBLEBroadcaster_taskFxn, &taskParams, NULL);
 }
 
+
 /*********************************************************************
  * @fn      SimpleBLEBroadcaster_init
  *
@@ -293,7 +405,7 @@ void SimpleBLEBroadcaster_createTask(void)
  */
 static void SimpleBLEBroadcaster_init(void)
 {
-	// ******************************************************************
+  // ******************************************************************
   // N0 STACK API CALLS CAN OCCUR BEFORE THIS CALL TO ICall_registerApp
   // ******************************************************************
   // Register the current thread as an ICall dispatcher application
@@ -314,6 +426,7 @@ static void SimpleBLEBroadcaster_init(void)
   // Open LCD
   dispHandle = Display_open(Display_Type_LCD, NULL);
 
+  // Register Key Call Back
   Board_initKeys(SimpleBLEBroadcaster_keyChangeHandler);
 
   // Setup the GAP Broadcaster Role Profile
@@ -333,8 +446,6 @@ static void SimpleBLEBroadcaster_init(void)
 //#endif // !BEACON_FEATURE
 
     // Set the GAP Role Parameters
-
-
     GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
                          &initial_advertising_enable);
     GAPRole_SetParameter(GAPROLE_ADVERT_OFF_TIME, sizeof(uint16_t),
@@ -362,14 +473,64 @@ static void SimpleBLEBroadcaster_init(void)
 
   VOID GAPRole_StartDevice(&simpleBLEBroadcaster_BroadcasterCBs);
 
+  // Fetch configuration register
+  if (osal_snv_read(SNV_ID_CONFIG, sizeof(snvConfigReg), &snvConfigReg) != SUCCESS)
+  {
+      // First time initialization after a burning procedure
+      snvConfigReg = FLAG_FIRST_INI | FLAG_WAREHOUSE;
+
+      // Write first time to initialize SNV ID
+      osal_snv_write(SNV_ID_CONFIG, sizeof(snvConfigReg), &snvConfigReg);
+
+      // Initial application state after a burning procedure is warehouse mode
+      appState = STATE_WAREHOUSE;
+  }
+  else
+  {
+      /*
+      // Subsequent initializations the app initialize in previous warehouse state
+      appState = (snvConfigReg & FLAG_WAREHOUSE)? STATE_WAREHOUSE:STATE_ADV_NORMAL;
+
+      // Clear first time initialization after a burning procedure
+      snvConfigReg &= ~FLAG_FIRST_INI;
+
+      // Write in SNV
+      osal_snv_write(SNV_ID_CONFIG, sizeof(snvConfigReg), &snvConfigReg);
+
+      // Launch default advertising interval
+      if (appState == STATE_ADV_NORMAL)
+        */
+      appState = STATE_ADV_NORMAL;
+          setAdvIntData(ADV_DEFAULT);
+  }
+
+  // First hello world auto start led
   ledCtrlHandle = PIN_open(&ledCtrlState, ledCtrlCfg);
   PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
-  Util_constructClock(&initialLEDTimer, InitialLEDTimingHandler,5000, 0, true, 0);
+  Util_constructClock(&initialLEDTimer,
+                      InitialLEDTimingHandler,
+                      HELLOWORLD_TIMER, 0, true, 0);
+
+  // Battery measure clock
+  Util_constructClock(&batteryMeasureTimer,
+                      BatteryMeasureTimingHandler,
+                      BATTERY_PERIOD, BATTERY_PERIOD, true, 0);
+
+  // Longkey timer constructor
+  Util_constructClock(&longkeyTimer,
+                      longkeyTimingHandler,
+                      LONGKEY_TIMER, 0, false, 0);
+
+  // Shortkey timer constructor
+  Util_constructClock(&shortkeyTimer,
+                      shortkeyTimingHandler,
+                      SHORTKEY_TIMER, 0, false, 0);
 
   Display_print0(dispHandle, 0, 0, "BLE Broadcaster");
 
   HCI_EXT_AdvEventNoticeCmd(selfEntity, SBB_ADV_EVT);
 }
+
 
 /*********************************************************************
  * @fn      SimpleBLEBroadcaster_processEvent
@@ -435,6 +596,7 @@ static void SimpleBLEBroadcaster_taskFxn(UArg a0, UArg a1)
   }
 }
 
+
 /*********************************************************************
  * @fn      SimpleBLEBroadcaster_processStackMsg
  *
@@ -452,13 +614,6 @@ static void SimpleBLEBroadcaster_processStackMsg(ICall_Hdr *pMsg)
 	{
 		if (pEvt->event_flag & SBB_ADV_EVT)
 		{
-			// Advertisement ended. Process as desired
-			uint32_t batt;
-			// Battery monitor (bit 10:8 - integer, but 7:0 fraction)
-			batt = AONBatMonBatteryVoltageGet();
-			uint8_t intPart = (batt&0x0300)>>4;
-			uint32_t dPart = ((batt&0x00FF)*100)/256;
-			uint8_t decPart = (dPart/10)+(dPart%10>5);
 			if(alarmCounter>0)
 			{
 				advertData[6]=0x80;
@@ -469,40 +624,26 @@ static void SimpleBLEBroadcaster_processStackMsg(ICall_Hdr *pMsg)
 
 				if(alarmCounter==0)
 				{
-					uint8_t initial_advertising_enable = FALSE;
-					GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
-													 &initial_advertising_enable);
+				    setAdvIntData(ADV_DEFAULT);
 
-
-					// Set advertising interval
-					uint16_t advInt = DEFAULT_ADVERTISING_INTERVAL;
-
-					GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MIN, advInt);
-					GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MAX, advInt);
-					GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MIN, advInt);
-					GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MAX, advInt);
-
-
-					initial_advertising_enable = TRUE;
-					GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
-										 &initial_advertising_enable);
-
-
-					advertData[6]=0x00;
-					PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_OFF);
-
+                    advertData[6]=0x00;
+                    PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_OFF);
 				}
 			}
 			else
+			{
 				advertData[6]=0x00;
+			}
 
-			advertData[6]|=intPart|decPart;
-			advertData[7]++;//counter
+            // Compose and update advertising data
+            advertData[6] |= batt; // battery
+            advertData[7]++;       // counter
+
 			GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
 		}
 	}
-
 }
+
 
 /*********************************************************************
  * @fn      SimpleBLEBroadcaster_keyChangeHandler
@@ -515,18 +656,273 @@ static void SimpleBLEBroadcaster_processStackMsg(ICall_Hdr *pMsg)
  */
 void SimpleBLEBroadcaster_keyChangeHandler(uint8 keys)
 {
-	sbbEvt_t *pMsg;
+  sbbEvt_t *pMsg;
 
-	  // Create dynamic pointer to message.
-	  if ((pMsg = ICall_malloc(sizeof(sbbEvt_t))))
-	  {
-	    pMsg->hdr.event = SBB_KEY_CHANGE_EVT;
-	    pMsg->hdr.state = keys;
+  // Create dynamic pointer to message.
+  if ((pMsg = ICall_malloc(sizeof(sbbEvt_t))))
+  {
+    pMsg->hdr.event = SBB_KEY_CHANGE_EVT;
+	pMsg->hdr.state = keys;
 
-	    // Enqueue the message.
-	    Util_enqueueMsg(appMsgQueue, sem, (uint8*)pMsg);
-	  }
+	// Enqueue the message.
+	Util_enqueueMsg(appMsgQueue, sem, (uint8*)pMsg);
+  }
 }
+
+
+/*********************************************************************
+ * @fn      SimpleBLEPeripheral_atuomateHandle
+ *
+ * @brief   Moore automate implementation for smartcare-beacon
+ *
+ * @param
+ *
+ * @return  none
+ */
+void SimpleBLEPeripheral_atuomateHandler(uint8_t key)
+{
+  static uint8_t appStateNew;
+
+  switch (appState)
+  {
+
+/// warehouse state ///////////////////////////////////// Beacon Automate //////
+    case STATE_WAREHOUSE:
+    case STATE_ADV_KEEPALIVE:
+    {
+      // KEY_1 pressed (rising edge interruption handled)
+      if (key)
+      {
+#ifdef BEACON_WRISTBAND
+          // Set advertising data
+          setAdvIntData(ADV_ALARM);
+
+          // Set alarm counter
+          alarmCounter = EVENTOS_EN_UN_MINUTO;
+
+          // Launch alarm led
+          PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
+          Util_restartClock(&initialLEDTimer, LED_BLINK_DURATION_MS);
+
+          // Next state
+//          appStateNew = STATE_ADV_ALARM;
+          appStateNew = STATE_ADV_NORMAL;
+#endif
+
+#ifdef BEACON_KEYRINGUS
+          // Set advertising data
+          setAdvIntData(ADV_DEFAULT);
+
+          // Led on
+          PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
+
+          // Next state
+          appStateNew = STATE_ADV_NORMAL;
+#endif
+
+      }
+
+      // KEY_1 not pressed (falling edge interruption handled)
+      else
+      {
+          // Next state
+          appStateNew = appState;
+      }
+    }
+    break;
+
+/// advertising normal ////////////////////////////////// Beacon Automate //////
+    case STATE_ADV_NORMAL:
+
+        // Handle key interruptions
+        if (key) // Rising Edge
+        {
+            // Actions: 1.- restart longkey timer
+            // Actions: 1.- restart shortkey timer
+            Util_restartClock(&shortkeyTimer, SHORTKEY_TIMER);
+            Util_restartClock(&longkeyTimer, LONGKEY_TIMER);
+
+#ifdef BEACON_KEYRINGUS
+            // Led on
+            PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
+#endif
+
+            // Next state
+            appStateNew = appState;
+
+        }
+
+        else // Falling Edge
+        {
+            // Stop all timers
+            Util_stopClock(&shortkeyTimer);
+            Util_stopClock(&longkeyTimer);
+
+            // Compute key_time flags
+            if (keyTimeoutLong)
+            {
+                // Stop advertising
+                setAdvIntData(ADV_STOP);
+
+                // Launch keepalive led
+                PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
+                Util_restartClock(&initialLEDTimer, LED_BLINK_DURATION_MS*40);
+
+                // Next state
+                appStateNew = STATE_WAREHOUSE;
+            }
+
+            else if (keyTimeoutShort)
+            {
+                // Set advertising data
+                setAdvIntData(ADV_KEEPALIVE);
+
+                // Launch keepalive led
+                PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
+                Util_restartClock(&initialLEDTimer, LED_BLINK_DURATION_MS*10);
+
+                // Next state
+                appStateNew = STATE_ADV_KEEPALIVE;
+            }
+
+            else
+            {
+
+#ifdef BEACON_WRISTBAND
+              // Set advertising data
+              setAdvIntData(ADV_ALARM);
+
+              // Set alarm counter
+              alarmCounter = EVENTOS_EN_UN_MINUTO;
+
+              // Launch alarm led
+              PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
+              Util_restartClock(&initialLEDTimer, LED_BLINK_DURATION_MS);
+
+              // Next state
+//              appStateNew = STATE_ADV_ALARM;
+              appStateNew = STATE_ADV_NORMAL;
+#endif
+
+
+#ifdef BEACON_KEYRINGUS
+                // Led off
+                PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_OFF);
+
+                // Next state
+                appStateNew = appState;
+#endif
+
+            }
+
+            // Clear flags
+            keyTimeoutLong  = false;
+            keyTimeoutShort = false;
+        }
+
+      break;
+
+/// advertising alarm /////////////////////////////////// Beacon Automate //////
+    case STATE_ADV_ALARM:
+/*
+        if (alarmTimeout)
+        {
+            // Actions: 1.- clear alarm led
+
+            // Action:  2.- stop advertising packets
+            // Action:  3.- set normal advertise data and timing
+            // Action:  4.- launch advertising packets
+
+            // Next state
+            appStateNew = STATE_ADV_NORMAL;
+        }
+        else
+        {
+            // Next state
+            appStateNew = appState;
+        }
+*/
+      break;
+
+/// advertising keepalive /////////////////////////////// Beacon Automate //////
+/*
+    case STATE_ADV_KEEPALIVE:
+
+        if (key)
+        {
+            // Actions: 1.- launch alarm timeout.
+            // Actions: 2.- launch alarm led.
+
+            // Action:  3.- stop advertising packets
+            // Action:  4.- set alarm advertise data and timing
+            // Action:  5.- launch advertising packets
+
+
+            // Next state
+            appStateNew = STATE_ADV_ALARM;
+        }
+        else
+        {
+            // Next state
+            appStateNew = appState;
+        }
+
+      break;
+*/
+/// unknow state!! /////////////////////////////////////////////////////////////
+    default:
+        // Should never get here!
+      break;
+  }
+
+  // Update appState
+  appState = appStateNew;
+}
+
+
+void setAdvIntData(uint8_t adv_mode)
+{
+    uint8_t initial_advertising_enable;
+
+    // Stop the actual advertising data
+    initial_advertising_enable = FALSE;
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
+                                     &initial_advertising_enable);
+
+    // Stop adverising
+    if (adv_mode == ADV_STOP) return;
+
+    uint16_t advInt;
+    // Set advertising interval
+    switch (adv_mode)
+    {
+      // Set advertising interval for alarm event
+      case ADV_DEFAULT:   advInt = DEFAULT_ADVERTISING_INTERVAL;  break;
+
+      // Set advertising interval for alarm event
+      case ADV_ALARM:     advInt = ALARM_ADVERTISING_INTERVAL;    break;
+
+      // Set advertising interval for alarm event
+      case ADV_KEEPALIVE: advInt = LONG_ADVERTISING_INTERVAL;     break;
+
+      default: break;
+    }
+
+    // Write GAP parameter
+    GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MIN, advInt);
+    GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MAX, advInt);
+    GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MIN, advInt);
+    GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MAX, advInt);
+
+    // Start advertising data
+    initial_advertising_enable = TRUE;
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
+                         &initial_advertising_enable);
+
+}
+
+
+
 
 /*********************************************************************
  * @fn      SimpleBLEPeripheral_processAppMsg
@@ -545,36 +941,89 @@ static void SimpleBLEBroadcaster_processAppMsg(sbbEvt_t *pMsg)
       SimpleBLEBroadcaster_processStateChangeEvt((gaprole_States_t)pMsg->
                                                  hdr.state);
       break;
+
     case SBB_KEY_CHANGE_EVT:
+        SimpleBLEPeripheral_atuomateHandler(pMsg->hdr.state);
+
+/*
+        // Wait for Wakeup
+        if (!wakeup)
+        {
+            // KEY_1 pressed (rising edge interruption handled)
+            if(pMsg->hdr.state)
+            {
+               Util_restartClock(&wakeupTimer, WAKEUP_TIMER);
+            }
+
+            // KEY_1 not pressed (falling edge interruption handled)
+            else
+            {
+               Util_stopClock(&wakeupTimer);
+            }
+
+            break;
+        }
+
+        // KEY_1 pressed (rising edge interruption handled)
     	if(pMsg->hdr.state)
     	{
-    		uint8_t initial_advertising_enable = FALSE;
-    		GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
-    										 &initial_advertising_enable);
+            uint8_t initial_advertising_enable;
 
-    		PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
-    		Util_restartClock(&initialLEDTimer, LED_BLINK_DURATION_MS);
+    	    // WRISTBAND MODE
+    		if (ALARM_ADVERTISING_INTERVAL)
+    		{
+    		    // Stop the actual advertising data
+                initial_advertising_enable = FALSE;
+                GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
+                                                 &initial_advertising_enable);
 
-    		// Set advertising interval
-			uint16_t advInt = ALARM_ADVERTISING_INTERVAL;
+                // Set advertising interval for alarm event
+                uint16_t advInt = ALARM_ADVERTISING_INTERVAL;
 
-			GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MIN, advInt);
-			GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MAX, advInt);
-			GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MIN, advInt);
-			GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MAX, advInt);
+                GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MIN, advInt);
+                GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MAX, advInt);
+                GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MIN, advInt);
+                GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MAX, advInt);
 
-			alarmCounter=EVENTOS_EN_UN_MINUTO;
+                alarmCounter=EVENTOS_EN_UN_MINUTO;
 
-			initial_advertising_enable = TRUE;
-			GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
-								 &initial_advertising_enable);
+                initial_advertising_enable = TRUE;
+                GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
+                                     &initial_advertising_enable);
+
+                // Led flashing every ALARM_ADVERTISING_INTERVAL
+                PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_ON);
+                Util_restartClock(&initialLEDTimer, LED_BLINK_DURATION_MS);
+    		}
+
+            // KEYRINGUS MODE
+    		else
+    		{
+    		    // First advertising when the button has been pressed
+                initial_advertising_enable = TRUE;
+                GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
+                                     &initial_advertising_enable);
+
+                // Led on
+                PIN_setOutputValue(ledCtrlHandle, Board_LED1, !PIN_getOutputValue(Board_LED1));
+    		}
     	}
-    break;
+
+    	// KEY_1 not pressed (falling edge interruption handled)
+    	else
+    	{
+    	    // Led off
+            PIN_setOutputValue(ledCtrlHandle, Board_LED1, Board_LED_OFF);
+    	}
+*/
+      break;
+
     default:
       // Do nothing.
       break;
   }
 }
+
 
 /*********************************************************************
  * @fn      SimpleBLEBroadcaster_stateChangeCB
@@ -599,6 +1048,7 @@ static void SimpleBLEBroadcaster_stateChangeCB(gaprole_States_t newState)
     Util_enqueueMsg(appMsgQueue, sem, (uint8*)pMsg);
   }
 }
+
 
 /*********************************************************************
  * @fn      SimpleBLEBroadcaster_processStateChangeEvt
@@ -650,6 +1100,7 @@ static void SimpleBLEBroadcaster_processStateChangeEvt(gaprole_States_t newState
       break;
   }
 }
+
 
 /*********************************************************************
 *********************************************************************/

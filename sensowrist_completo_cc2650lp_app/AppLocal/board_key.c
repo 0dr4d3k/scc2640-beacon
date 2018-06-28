@@ -96,9 +96,10 @@ keysPressedCB_t appKeyChangeHandler = NULL;
 Hwi_Struct callbackHwiKeys;
 
 // PIN configuration structure to set all KEY pins as inputs with pullups enabled
+// Button is active low
 PIN_Config keyPinsCfg[] =
 {
-	Board_KEY_1      | PIN_INPUT_EN  | PIN_PULLUP | PIN_HYSTERESIS,                             /* Button is active low            */
+	Board_KEY_1      | PIN_INPUT_EN  | PIN_PULLUP | PIN_HYSTERESIS,
     PIN_TERMINATE
 };
 
@@ -123,12 +124,11 @@ void Board_initKeys(keysPressedCB_t appKeyCB)
   hKeyPins = PIN_open(&keyPins, keyPinsCfg);
   PIN_registerIntCb(hKeyPins, Board_keyCallback);
 
-  PIN_setConfig(hKeyPins, PIN_BM_IRQ, Board_KEY_1  | PIN_IRQ_NEGEDGE);
+//  PIN_setConfig(hKeyPins, PIN_BM_IRQ, Board_KEY_1 | PIN_IRQ_NEGEDGE);
+  PIN_setConfig(hKeyPins, PIN_BM_IRQ, Board_KEY_1 | PIN_IRQ_BOTHEDGES);
 
 #ifdef POWER_SAVING
-
   PIN_setConfig(hKeyPins, PINCC26XX_BM_WAKEUP, Board_KEY_1 | PINCC26XX_WAKEUP_NEGEDGE);
-
 #endif //POWER_SAVING
   
   // Setup keycallback for keys
