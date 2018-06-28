@@ -86,8 +86,8 @@
  * CONSTANTS
  */
 // Select the beacon type
-//#define BEACON_WRISTBAND
-#define BEACON_KEYRINGUS
+#define BEACON_WRISTBAND
+//#define BEACON_KEYRINGUS
 
 
 #ifdef BEACON_WRISTBAND
